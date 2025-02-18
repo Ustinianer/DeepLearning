@@ -7,6 +7,10 @@ import torch.distributed as dist
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.utils import set_seed, DummyOptim, DummyScheduler
 
+# from simple_lora import add_lora
+from peft import LoraConfig, get_peft_model, PeftModel
+
+
 # 简单的模型
 def get_model():
     return nn.Sequential(
@@ -40,6 +44,31 @@ def train():
     device = accelerator.device
     
     model = get_model()
+
+    # Injecting LoRA layers into unet
+    if config.lora.use_lora:
+        if config.lora.resume_lora_path:
+            model = PeftModel.from_pretrained(model, config.lora.resume_lora_path, is_trainable=True)
+            resume_global_step = torch.load(os.path.join(config.lora.resume_lora_path, "state_dict.pt"), map_location=device)["global_step"]
+        else:
+            lora_config = LoraConfig(
+                r=config.lora.r,                      
+                lora_alpha=config.lora.lora_alpha,            
+                target_modules=list(config.lora.target_modules),  
+                bias=config.lora.bias,
+                lora_dropout=config.lora.lora_dropout,
+                task_type=config.lora.task_type,      
+            )
+            model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+        # # 自定义lora
+        # add_lora(model)
+        # print(model) if is_main_process else print("lora added")
+    else:
+        model.requires_grad_(True)
+        trainable_params = list(model.parameters())
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
@@ -111,9 +140,37 @@ def train():
             optimizer.step()
             total_loss += loss.item()
 
-            # 保存训练状态、权重、以及accelerator.register_for_checkpointing(my_scheduler)方法注册的类的状态
-            accelerator.save_state(output_dir)  # 若使用了deepspeed保存的是deepspeed格式的权重，且应该在所有进程中都执行，deepspeed格式可通过Deepspeed的脚本直接转换为torch的权重
+            # 保存权重 使用 accelerate + Deepspeed + PEFT 保存权重方式
+            # 方式一（可恢复训练）：使用accelerator.save_state(model_save_path) 统一保存，包括完整模型、优化器、学习率调度器等
+            #    保存的为Deepspeed模式的权重，可使用Deepspeed提供的zero_to_fp32.py脚本转为peft包装后的torch权重
+            #    转换思路 Deepspeed -> peft -> 原model.pth
+            # 方式二（无法恢复训练）：先解包到peft模型，然后手动保存lora权重、优化器和学习率调度器状态，accelerte没有提供优化器状态加载接口，实际上无法恢复优化器状态，故只需保存lora权重即可舍弃训练状态
+            #   1 使用 accelerator.unwrap_model(model) 获取PEFT模型
+            #   2 使用 accelerator.get_state_dict(optimizer) 获取优化器状态  （无法恢复优化器状态）
+            #   3 使用 lr_scheduler.state_dict() 获取学习率调度器状态  
+            if global_step % config.ckpt.save_ckpt_steps == 0:
+                accelerator.wait_for_everyone()  # 确保所有进程同步
+                if is_main_process:
+                    # 只保存lora权重
+                    model_save_path = os.path.join(output_dir, f"checkpoints/checkpoint-{global_step}")
+                    lora_model = accelerator.unwrap_model(unet)  # unwrap DeepspeedEngine aimed to get peft model (返回的是一个新的引用，不会影响训练)
+                    lora_model.save_pretrained(model_save_path, save_adapter=True)   
 
+                    if hasattr(unet, 'lr_scheduler'):
+                        lr_scheduler_state = unet.lr_scheduler.state_dict()  # 从deepspeed模型中获取学习率调度器状态
+                    elif hasattr(unet, 'optimizer') and hasattr(unet.optimizer, 'lr_scheduler'):
+                        lr_scheduler_state = unet.optimizer.lr_scheduler.state_dict()  # 从deepspeed模型的optimizer中获取学习率调度器状态
+
+                    
+                    # 保存优化器和学习率调度器状态
+                    torch.save(
+                        {
+                            "global_step": global_step,
+                            "optimizer": accelerator.get_state_dict(optimizer),  # DeepSpeed 兼容
+                            "lr_scheduler": lr_scheduler_state,
+                        },
+                        os.path.join(model_save_path, "state_dict.pt")
+                    )
 
         print(f"Epoch {epoch + 1}, Loss: {total_loss / len(train_dataloader)}")
 
