@@ -1,2 +1,2 @@
 #!/bin/bash
-CUDA_VISIBLE_DEVICES="2,4" accelerate launch --config_file accelerate_config.yaml train.py 
+deepspeed --include localhost:0,1,2,4 train.py  --deepspeed --deepspeed_config ds_config.json

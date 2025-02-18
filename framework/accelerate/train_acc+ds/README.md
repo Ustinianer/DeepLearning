@@ -6,3 +6,6 @@
 3 deepspeed的配置文件：ds4acc_config.json
 
 
+参考：
+
+说明文档：https://huggingface.co/docs/accelerate/usage_guides/deepspeed
