@@ -1,0 +1,1 @@
+docker build --no-cache -t dev_base:v1 -f ./Dockerfile .
